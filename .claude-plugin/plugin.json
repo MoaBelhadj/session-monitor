@@ -1,0 +1,6 @@
+{
+  "name": "session-monitor",
+  "version": "0.1.0",
+  "description": "One pane listing every Code session: ongoing, complete or idle, with details and an Open session link",
+  "types": "./types/index.d.ts"
+}
