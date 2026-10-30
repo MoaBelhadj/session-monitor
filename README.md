@@ -10,3 +10,7 @@ A Claude Code desktop mod: one pane listing every Code session as **Ongoing**, *
 
 - `.claude-plugin/types/` holds generated SDK typings and is git-ignored; the app regenerates them.
 - Open session uses `cmd /c start`, so it is Windows-only for now (it copies the link elsewhere).
+
+## License
+
+MIT, see [LICENSE](LICENSE).
