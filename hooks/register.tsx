@@ -27,6 +27,27 @@ const C = {
   bg: '#FAF7F2', panel: '#FFFFFF', text: '#2B2A28', muted: '#6F6A63', border: '#E6E0D6',
   accent: '#C8613F', accentBg: '#F9EDE7', green: '#2E7D4F', greenBg: '#E8F3EC', idle: '#9A948B',
 }
+// Pane backdrop: glowing blobs, a dot grid, contour waves and a faint ✱. Tall so it
+// scales to the pane's width and still covers long content; the rest is C.bg.
+const WAVE = 'M-40 0C160-70 320 90 520 20S880-60 1240 30'
+const BACKDROP = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 3000" width="1200" height="3000">
+<defs>
+<radialGradient id="a"><stop offset="0" stop-color="${C.accent}" stop-opacity=".28"/><stop offset="1" stop-color="${C.accent}" stop-opacity="0"/></radialGradient>
+<radialGradient id="g"><stop offset="0" stop-color="${C.green}" stop-opacity=".18"/><stop offset="1" stop-color="${C.green}" stop-opacity="0"/></radialGradient>
+<radialGradient id="s"><stop offset="0" stop-color="#E9B78E" stop-opacity=".35"/><stop offset="1" stop-color="#E9B78E" stop-opacity="0"/></radialGradient>
+<pattern id="d" width="44" height="44" patternUnits="userSpaceOnUse"><circle cx="4" cy="4" r="2.6" fill="${C.text}" fill-opacity=".07"/></pattern>
+<path id="w" d="${WAVE}" fill="none" stroke-width="4.5"/>
+</defs>
+<rect width="1200" height="3000" fill="${C.bg}"/>
+<rect width="1200" height="3000" fill="url(#d)"/>
+<circle cx="1080" cy="80" r="620" fill="url(#a)"/>
+<circle cx="60" cy="1150" r="680" fill="url(#g)"/>
+<circle cx="980" cy="2100" r="720" fill="url(#s)"/>
+<circle cx="200" cy="2850" r="600" fill="url(#a)"/>
+<g stroke="${C.accent}" stroke-opacity=".2">${[0, 1, 2, 3, 4, 5].map(i => `<use href="#w" y="${420 + i * 34}"/>`).join('')}</g>
+<g stroke="${C.green}" stroke-opacity=".16">${[0, 1, 2, 3, 4].map(i => `<use href="#w" y="${1700 + i * 40}"/>`).join('')}</g>
+<g transform="translate(1040 150)" stroke="${C.accent}" stroke-opacity=".16" stroke-width="22" stroke-linecap="round"><path d="M0-110V110M-95-55L95 55M-95 55L95-55"/></g>
+</svg>`
 const LABEL: Record<Status, { icon: string; text: string; color: string; bg: string }> = {
   ongoing: { icon: '●', text: 'Ongoing', color: C.accent, bg: C.accentBg },
   complete: { icon: '✓', text: 'Complete', color: C.green, bg: C.greenBg },
@@ -162,6 +183,8 @@ export const register: Register = on => {
     const { Box, Text, Button } = els
     // shortcut: the mobile table draws no Input, so search is a desktop/terminal/vscode feature; revisit when mobile gets one
     const Input = 'Input' in els ? els.Input : undefined
+    // The terminal table draws no Svg, so it keeps the flat C.bg.
+    const Svg = 'Svg' in els ? els.Svg : undefined
     const [list, src, sel, flt, q, v, idleMin, tasks, order, now] = await Promise.all([
       read($, sessions), read($, source), read($, selected), read($, filter), read($, search), read($, view), read($, idleWithin), read($, todos), read($, navOrder), $.clock.now(),
     ])
@@ -201,6 +224,11 @@ export const register: Register = on => {
 
     return (
       <Box flexDirection="column" backgroundColor={C.bg} padding="md" gap="md">
+        {Svg && (
+          <Box position="absolute" top={0} left={0} right={0} bottom={0} overflow="hidden">
+            <Svg source={BACKDROP} alt="" />
+          </Box>
+        )}
         <Box flexDirection="row" gap="md" alignItems="center" flexWrap="wrap">
           <Text color={C.accent} size="heading" weight="bold">✱ Claude</Text>
           {order.map(id => <Nav id={id} />)}
