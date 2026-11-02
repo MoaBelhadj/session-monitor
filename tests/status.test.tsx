@@ -71,6 +71,41 @@ test('when the app list cannot be read the pane says so and labels demo rows', a
   await ui.unmount()
 })
 
+test('Dark in Settings repaints the pane', async ($, on) => {
+  const clock = mock.clock(on)
+  mock.store(on)
+  on('command.register', () => ({ value: { command: 'sessions' } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('mcp.call', () => ({ value: { content: [{ type: 'text', text: '[]' }], isError: false } }))
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await clock.settle()
+
+  const ui = await $.ui.mount(PANE)
+  expect(await ui.drawn()).toMatchObject({ props: { backgroundColor: '#FAF7F2' } })
+  await ui.press({ key: 'nav-settings' })
+  await ui.press({ key: 'theme-dark' })
+  expect(await ui.drawn()).toMatchObject({ props: { backgroundColor: '#1C1B19' } })
+  await ui.unmount()
+})
+
+test('a theme stored by an earlier session is drawn from the start', async ($, on) => {
+  const clock = mock.clock(on)
+  mock.store(on, { theme: 'dark' })
+  on('command.register', () => ({ value: { command: 'sessions' } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('mcp.call', () => ({ value: { content: [{ type: 'text', text: '[]' }], isError: false } }))
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await clock.settle()
+
+  const ui = await $.ui.mount(PANE)
+  expect(await ui.drawn()).toMatchObject({ props: { backgroundColor: '#1C1B19' } })
+  await ui.unmount()
+})
+
 test('a task typed into the To do field is listed and can be checked off', async ($, on) => {
   const clock = mock.clock(on)
   mock.store(on)

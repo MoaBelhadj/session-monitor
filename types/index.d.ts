@@ -34,6 +34,7 @@ declare module 'claude-code' {
       idleWithin: number
       todos: Shaped<Todo[]>
       navOrder: ('new' | 'sessions' | 'projects' | 'settings')[]
+      theme: 'light' | 'dark'
     }
   }
 }

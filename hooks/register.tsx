@@ -19,22 +19,31 @@ const todos = atom({ plugin: 'session-monitor', key: 'todos' } as const, [] as T
 type NavId = 'new' | 'sessions' | 'projects' | 'settings'
 const NAV_LABEL: Record<NavId, string> = { new: 'New chat', sessions: 'Session monitor', projects: 'Projects', settings: 'Settings' }
 const navOrder = atom({ plugin: 'session-monitor', key: 'navOrder' } as const, ['new', 'sessions', 'projects', 'settings'] as NavId[])
+// The engine does not tell a pane the app's light/dark mode, so the person picks it.
+const theme = atom({ plugin: 'session-monitor', key: 'theme' } as const, 'light' as 'light' | 'dark')
 const WHO: Record<Entry['who'], string> = { user: 'You', assistant: 'Claude', tool: 'Tool', result: 'Result', system: 'System' }
 const IDLE_CHOICES = [{ m: 60, label: 'Last hour' }, { m: 1440, label: 'Last day' }, { m: 10080, label: 'Last week' }, { m: 0, label: 'All' }]
 
-// Reference palette: warm ivory, charcoal, terracotta, green.
-const C = {
-  bg: '#FAF7F2', panel: '#FFFFFF', text: '#2B2A28', muted: '#6F6A63', border: '#E6E0D6',
-  accent: '#C8613F', accentBg: '#F9EDE7', green: '#2E7D4F', greenBg: '#E8F3EC', idle: '#9A948B',
+// Reference palette: warm ivory, charcoal, terracotta, green; dark is the same hues on warm charcoal.
+const PALETTE = {
+  light: {
+    bg: '#FAF7F2', panel: '#FFFFFF', text: '#2B2A28', muted: '#6F6A63', border: '#E6E0D6',
+    accent: '#C8613F', accentBg: '#F9EDE7', green: '#2E7D4F', greenBg: '#E8F3EC', idle: '#9A948B', sand: '#E9B78E',
+  },
+  dark: {
+    bg: '#1C1B19', panel: '#262523', text: '#ECE7DF', muted: '#A8A198', border: '#3A3734',
+    accent: '#E27D5A', accentBg: '#3B2820', green: '#5FB585', greenBg: '#1F3328', idle: '#857F77', sand: '#B9835A',
+  },
 }
+type Palette = typeof PALETTE.light
 // Pane backdrop: glowing blobs, a dot grid, contour waves and a faint ✱. Tall so it
 // scales to the pane's width and still covers long content; the rest is C.bg.
 const WAVE = 'M-40 0C160-70 320 90 520 20S880-60 1240 30'
-const BACKDROP = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 3000" width="1200" height="3000">
+const backdrop = (C: Palette) => `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 3000" width="1200" height="3000">
 <defs>
 <radialGradient id="a"><stop offset="0" stop-color="${C.accent}" stop-opacity=".28"/><stop offset="1" stop-color="${C.accent}" stop-opacity="0"/></radialGradient>
 <radialGradient id="g"><stop offset="0" stop-color="${C.green}" stop-opacity=".18"/><stop offset="1" stop-color="${C.green}" stop-opacity="0"/></radialGradient>
-<radialGradient id="s"><stop offset="0" stop-color="#E9B78E" stop-opacity=".35"/><stop offset="1" stop-color="#E9B78E" stop-opacity="0"/></radialGradient>
+<radialGradient id="s"><stop offset="0" stop-color="${C.sand}" stop-opacity=".35"/><stop offset="1" stop-color="${C.sand}" stop-opacity="0"/></radialGradient>
 <pattern id="d" width="44" height="44" patternUnits="userSpaceOnUse"><circle cx="4" cy="4" r="2.6" fill="${C.text}" fill-opacity=".07"/></pattern>
 <path id="w" d="${WAVE}" fill="none" stroke-width="4.5"/>
 </defs>
@@ -48,11 +57,11 @@ const BACKDROP = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 3000
 <g stroke="${C.green}" stroke-opacity=".16">${[0, 1, 2, 3, 4].map(i => `<use href="#w" y="${1700 + i * 40}"/>`).join('')}</g>
 <g transform="translate(1040 150)" stroke="${C.accent}" stroke-opacity=".16" stroke-width="22" stroke-linecap="round"><path d="M0-110V110M-95-55L95 55M-95 55L95-55"/></g>
 </svg>`
-const LABEL: Record<Status, { icon: string; text: string; color: string; bg: string }> = {
+const labels = (C: Palette): Record<Status, { icon: string; text: string; color: string; bg: string }> => ({
   ongoing: { icon: '●', text: 'Ongoing', color: C.accent, bg: C.accentBg },
   complete: { icon: '✓', text: 'Complete', color: C.green, bg: C.greenBg },
   idle: { icon: '○', text: 'Idle', color: C.idle, bg: C.border },
-}
+})
 
 // Shown only when the app's session list cannot be read; every row says so.
 const DEMO: Session[] = [
@@ -167,6 +176,8 @@ export const register: Register = on => {
     if (Array.isArray(kept)) await update($, todos, () => kept as Todo[])
     const order = await $.store.get('navOrder')
     if (Array.isArray(order) && order.length === 4) await update($, navOrder, () => order as NavId[])
+    const look = await $.store.get('theme')
+    if (look === 'light' || look === 'dark') await update($, theme, () => look)
     void poll($)
     $.clock.every(POLL_MS, () => void poll($))
     return next(e)
@@ -185,9 +196,11 @@ export const register: Register = on => {
     const Input = 'Input' in els ? els.Input : undefined
     // The terminal table draws no Svg, so it keeps the flat C.bg.
     const Svg = 'Svg' in els ? els.Svg : undefined
-    const [list, src, sel, flt, q, v, idleMin, tasks, order, now] = await Promise.all([
-      read($, sessions), read($, source), read($, selected), read($, filter), read($, search), read($, view), read($, idleWithin), read($, todos), read($, navOrder), $.clock.now(),
+    const [list, src, sel, flt, q, v, idleMin, tasks, order, look, now] = await Promise.all([
+      read($, sessions), read($, source), read($, selected), read($, filter), read($, search), read($, view), read($, idleWithin), read($, todos), read($, navOrder), read($, theme), $.clock.now(),
     ])
+    const C = PALETTE[look]
+    const LABEL = labels(C)
     const counts = { ongoing: list.filter(s => s.status === 'ongoing').length, complete: list.filter(s => s.status === 'complete').length }
     const shown = list
       .filter(s => s.status !== 'idle' || !idleMin || now - Date.parse(s.lastActivityAt) <= idleMin * 60_000)
@@ -226,7 +239,7 @@ export const register: Register = on => {
       <Box flexDirection="column" backgroundColor={C.bg} padding="md" gap="md">
         {Svg && (
           <Box position="absolute" top={0} left={0} right={0} bottom={0} overflow="hidden">
-            <Svg source={BACKDROP} alt="" />
+            <Svg source={backdrop(C)} alt="" />
           </Box>
         )}
         <Box flexDirection="row" gap="md" alignItems="center" flexWrap="wrap">
@@ -237,6 +250,15 @@ export const register: Register = on => {
         {v === 'settings' && (
           <Box flexDirection="column" gap="sm" backgroundColor={C.panel} borderStyle="round" borderColor={C.border} padding="md" minWidth={0} overflow="hidden">
             <Text color={C.text} size="heading" weight="semibold">Settings</Text>
+            <Text color={C.text} weight="semibold">Theme</Text>
+            <Box flexDirection="row" gap="sm" flexWrap="wrap">
+              {(['light', 'dark'] as const).map(t => (
+                <Button key={`theme-${t}`} variant={look === t ? 'primary' : 'secondary'}
+                  onPress={() => { void $.store.set('theme', t); return update($, theme, () => t) }}>
+                  {t === 'light' ? '☀ Light' : '☾ Dark'}
+                </Button>
+              ))}
+            </Box>
             <Text color={C.text} weight="semibold">Menu order</Text>
             <Text color={C.muted} size="footnote" wrap="wrap">Top to bottom here is left to right in the menu.</Text>
             <Box flexDirection="column" backgroundColor={C.bg} borderStyle="round" borderColor={C.border}>
