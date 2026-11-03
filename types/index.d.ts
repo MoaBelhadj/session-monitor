@@ -22,6 +22,30 @@ export type Todo = { id: string; text: string; done: boolean }
 
 export type Source = { kind: 'live'; at: number } | { kind: 'unavailable'; reason: string }
 
+/** A session that finished, or one that started working again. */
+export type NoticeKind = 'finished' | 'started'
+
+export type Notice = {
+  id: string
+  kind: NoticeKind
+  sessionId: string
+  title: string
+  /** ms epoch when the monitor saw it happen. */
+  at: number
+  read: boolean
+}
+
+export type NotifyPrefs = {
+  /** Notify when a session the monitor saw running stops. */
+  finished: boolean
+  /** Notify when an idle or complete session starts running again. */
+  started: boolean
+  /** Raise a system notification, not just the in-app toast. */
+  desktop: boolean
+  /** Show the small toast over the transcript. */
+  toast: boolean
+}
+
 declare module 'claude-code' {
   interface PluginState {
     'session-monitor': {
@@ -30,11 +54,13 @@ declare module 'claude-code' {
       selected: string
       filter: 'all' | 'ongoing' | 'complete'
       search: string
-      view: 'sessions' | 'projects' | 'settings'
+      view: 'sessions' | 'projects' | 'settings' | 'notifications'
       idleWithin: number
       todos: Shaped<Todo[]>
       navOrder: ('new' | 'sessions' | 'projects' | 'settings')[]
       theme: 'light' | 'dark'
+      notices: Shaped<Notice[]>
+      notifyPrefs: Shaped<NotifyPrefs>
     }
   }
 }

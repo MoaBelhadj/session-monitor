@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, UiPressArgument } from 'claude-code'
 
-import type { Entry, Session, Source, Status, Todo } from '../types'
+import type { Entry, Notice, NoticeKind, NotifyPrefs, Session, Source, Status, Todo } from '../types'
 
 const PANE = 'session-monitor'
 const MCP = 'ccd_session_mgmt'
@@ -12,7 +12,8 @@ const source = atom({ plugin: 'session-monitor', key: 'source' } as const, { kin
 const selected = atom({ plugin: 'session-monitor', key: 'selected' } as const, '')
 const filter = atom({ plugin: 'session-monitor', key: 'filter' } as const, 'all' as 'all' | 'ongoing' | 'complete')
 const search = atom({ plugin: 'session-monitor', key: 'search' } as const, '')
-const view = atom({ plugin: 'session-monitor', key: 'view' } as const, 'sessions' as 'sessions' | 'projects' | 'settings')
+type ViewId = 'sessions' | 'projects' | 'settings' | 'notifications'
+const view = atom({ plugin: 'session-monitor', key: 'view' } as const, 'sessions' as ViewId)
 // Idle sessions older than this many minutes are hidden from the list; 0 shows all.
 const idleWithin = atom({ plugin: 'session-monitor', key: 'idleWithin' } as const, 1440)
 const todos = atom({ plugin: 'session-monitor', key: 'todos' } as const, [] as Todo[], { shape: 'todos-1' })
@@ -21,6 +22,38 @@ const NAV_LABEL: Record<NavId, string> = { new: 'New chat', sessions: 'Session m
 const navOrder = atom({ plugin: 'session-monitor', key: 'navOrder' } as const, ['new', 'sessions', 'projects', 'settings'] as NavId[])
 // The engine does not tell a pane the app's light/dark mode, so the person picks it.
 const theme = atom({ plugin: 'session-monitor', key: 'theme' } as const, 'light' as 'light' | 'dark')
+// Notifications: the inbox the bell opens (newest first, kept in the store so every
+// session's monitor shows the same one) and what to notify about.
+const notices = atom({ plugin: 'session-monitor', key: 'notices' } as const, [] as Notice[], { shape: 'notices-1' })
+const DEFAULT_PREFS: NotifyPrefs = { finished: true, started: false, desktop: true, toast: true }
+const notifyPrefs = atom({ plugin: 'session-monitor', key: 'notifyPrefs' } as const, DEFAULT_PREFS, { shape: 'notify-1' })
+const MAX_NOTICES = 50
+// Every open session runs its own monitor. One that sees an event another already
+// put in the inbox this close in time leaves the desktop notification to that one.
+const SAME_EVENT_MS = 60_000
+const PREF_LABEL: Record<keyof NotifyPrefs, string> = {
+  finished: 'When a session finishes', started: 'When a session starts working',
+  desktop: 'Desktop notifications', toast: 'In-app toasts',
+}
+const HEAD: Record<NoticeKind, string> = { finished: 'Session complete', started: 'Session started' }
+// The desktop app has no terminal to notify through, so on Windows the toast is raised
+// with PowerShell. The script is fixed; the text arrives in environment variables and
+// is escaped for XML inside it, so a session title cannot change what runs. Clicking
+// the toast opens SM_LINK, the session's own claude:// link.
+const TOAST_PS = String.raw`$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+$null = [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]
+$null = [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom, ContentType = WindowsRuntime]
+function Esc([string]$s) { [Security.SecurityElement]::Escape($s) }
+$open = ''
+if ($env:SM_LINK) { $open = " activationType='protocol' launch='" + (Esc $env:SM_LINK) + "'" }
+$xml = New-Object Windows.Data.Xml.Dom.XmlDocument
+$xml.LoadXml("<toast$open><visual><binding template='ToastGeneric'><text>" + (Esc $env:SM_TITLE) + "</text><text>" + (Esc $env:SM_BODY) + "</text></binding></visual></toast>")
+$app = '{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe'
+[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($app).Show([Windows.UI.Notifications.ToastNotification]::new($xml))`
+// -EncodedCommand takes the script as base64 UTF-16LE, so no quoting reaches the shell.
+const utf16le = (s: string) => Array.from(s, c => String.fromCharCode(c.charCodeAt(0) & 255, c.charCodeAt(0) >> 8)).join('')
+const TOAST_ARGV = ['powershell.exe', '-NoProfile', '-NonInteractive', '-EncodedCommand', btoa(utf16le(TOAST_PS))]
 const WHO: Record<Entry['who'], string> = { user: 'You', assistant: 'Claude', tool: 'Tool', result: 'Result', system: 'System' }
 const IDLE_CHOICES = [{ m: 60, label: 'Last hour' }, { m: 1440, label: 'Last day' }, { m: 10080, label: 'Last week' }, { m: 0, label: 'All' }]
 
@@ -105,6 +138,57 @@ async function activity($: EngineInterface, id: string): Promise<Entry[] | undef
   }
 }
 
+// Changes the inbox as it stands in the store, so another session's additions are kept.
+async function setNotices($: EngineInterface, fn: (list: Notice[]) => Notice[]) {
+  const kept = await $.store.get('notices')
+  const next = fn(Array.isArray(kept) ? (kept as Notice[]) : await read($, notices))
+  await $.store.set('notices', next)
+  return update($, notices, () => next)
+}
+
+// Puts fresh events in the inbox and returns the ones no other session's monitor put
+// there first: those are this monitor's to send as desktop notifications.
+async function record($: EngineInterface, fresh: Notice[]): Promise<Notice[]> {
+  const kept = await $.store.get('notices')
+  const list = Array.isArray(kept) ? (kept as Notice[]) : await read($, notices)
+  const added = fresh.filter(n => !list.some(o => o.kind === n.kind && o.sessionId === n.sessionId && Math.abs(o.at - n.at) < SAME_EVENT_MS))
+  const next = added.length ? [...added, ...list].slice(0, MAX_NOTICES) : list
+  if (added.length) await $.store.set('notices', next)
+  await update($, notices, () => next)
+  return added
+}
+
+// The person's terminal notification channel when there is one; otherwise (the desktop
+// app has none) a Windows toast. Resolves whether either one sent it.
+async function desktopNotify($: EngineInterface, head: string, body: string, link?: string): Promise<boolean> {
+  const sent = await $.ui.notify(body, { title: head }).catch(() => undefined)
+  if (sent?.isSent) return true
+  // Notifications turned off in Claude Code settings, or refused by a hook: respect it.
+  if (sent && (sent.reason === 'disabled' || sent.reason === 'refused')) return false
+  // shortcut: Windows only (PowerShell toast); add osascript / notify-send when the mod runs elsewhere
+  const ran = await $.process.run(TOAST_ARGV, { env: { SM_TITLE: head, SM_BODY: body, SM_LINK: link ?? '' }, timeoutMs: 20_000 }).catch(() => undefined)
+  return ran?.exitCode === 0
+}
+
+async function announce($: EngineInterface, events: { kind: NoticeKind; s: Session }[], now: number) {
+  const prefs = await read($, notifyPrefs)
+  const fresh = events.filter(e => prefs[e.kind]).map(({ kind, s }): Notice => ({
+    id: `${kind}-${s.id}-${now}`, kind, sessionId: s.id, title: s.title, at: now, read: false,
+  }))
+  const added = await record($, fresh)
+  if (prefs.toast) for (const n of fresh) $.ui.toast(`${HEAD[n.kind]}: ${n.title}`, { timeoutMs: 6000 })
+  if (prefs.desktop) {
+    await Promise.all(added.map(n => desktopNotify($, HEAD[n.kind], n.title, events.find(e => e.s.id === n.sessionId)?.s.link)))
+  }
+}
+
+async function testNotify($: EngineInterface) {
+  const ok = await desktopNotify($, 'Session monitor', 'Notifications are on. You will get one like this when a session finishes.')
+  $.ui.toast(ok
+    ? 'Test notification sent. Not seeing it? Check Do not disturb, and that Windows PowerShell may notify in Windows Settings > Notifications.'
+    : 'No desktop notification could be sent from here.', { timeoutMs: 8000 })
+}
+
 async function poll($: EngineInterface) {
   const now = await $.clock.now()
   let rows: Row[]
@@ -123,23 +207,27 @@ async function poll($: EngineInterface) {
   const prev = await read($, sessions)
   const sel = await read($, selected)
   const merged: Session[] = []
+  const events: { kind: NoticeKind; s: Session }[] = []
   for (const row of [self, ...rows]) {
     if (!row?.sessionId) continue
     const old = prev.find(s => s.id === row.sessionId)
     let status: Status = row.isRunning ? 'ongoing' : old?.status === 'ongoing' ? 'complete' : (old?.status ?? 'idle')
     const finishedAt = status === 'complete' ? (old?.finishedAt ?? now) : undefined
-    if (old?.status === 'ongoing' && status === 'complete') {
-      $.ui.toast(`Session complete: ${row.title ?? row.sessionId}`, { timeoutMs: 6000 })
-    }
     const s: Session = {
       id: row.sessionId, title: row.title ?? '(untitled)', cwd: row.cwd ?? '', link: row.link,
       isSelf: row === self, status, lastActivityAt: row.lastActivityAt ?? '', finishedAt, activity: old?.activity,
     }
+    if (old?.status === 'ongoing' && status === 'complete') events.push({ kind: 'finished', s })
+    // Seen stopped on an earlier poll, so not one the first poll found already running;
+    // this session starts whenever the person sends it a message, so it is left out.
+    if (old && old.status !== 'ongoing' && status === 'ongoing' && row !== self) events.push({ kind: 'started', s })
     if (status === 'ongoing' || s.id === sel) s.activity = (await activity($, s.id)) ?? s.activity
     merged.push(s)
   }
   await update($, sessions, () => merged)
   await update($, source, (): Source => ({ kind: 'live', at: now }))
+  // Called with no events too: it picks up what other sessions' monitors added.
+  await announce($, events, now)
 }
 
 // The pane draws no claude:// Link and the app's focus call refuses sessions this
@@ -178,6 +266,10 @@ export const register: Register = on => {
     if (Array.isArray(order) && order.length === 4) await update($, navOrder, () => order as NavId[])
     const look = await $.store.get('theme')
     if (look === 'light' || look === 'dark') await update($, theme, () => look)
+    const prefs = await $.store.get('notifyPrefs')
+    if (prefs && typeof prefs === 'object') await update($, notifyPrefs, () => ({ ...DEFAULT_PREFS, ...(prefs as Partial<NotifyPrefs>) }))
+    const inbox = await $.store.get('notices')
+    if (Array.isArray(inbox)) await update($, notices, () => inbox as Notice[])
     void poll($)
     $.clock.every(POLL_MS, () => void poll($))
     return next(e)
@@ -196,10 +288,22 @@ export const register: Register = on => {
     const Input = 'Input' in els ? els.Input : undefined
     // The terminal table draws no Svg, so it keeps the flat C.bg.
     const Svg = 'Svg' in els ? els.Svg : undefined
-    const [list, src, sel, flt, q, v, idleMin, tasks, order, look, now] = await Promise.all([
-      read($, sessions), read($, source), read($, selected), read($, filter), read($, search), read($, view), read($, idleWithin), read($, todos), read($, navOrder), read($, theme), $.clock.now(),
+    const [list, src, sel, flt, q, v, idleMin, tasks, order, look, inbox, prefs, now] = await Promise.all([
+      read($, sessions), read($, source), read($, selected), read($, filter), read($, search), read($, view), read($, idleWithin), read($, todos), read($, navOrder), read($, theme),
+      read($, notices), read($, notifyPrefs), $.clock.now(),
     ])
     const C = PALETTE[look]
+    const unread = inbox.filter(n => !n.read).length
+    const togglePref = (k: keyof NotifyPrefs) => update($, notifyPrefs, p => {
+      const n = { ...p, [k]: !p[k] }
+      void $.store.set('notifyPrefs', n)
+      return n
+    })
+    const openNotice = async (n: Notice) => {
+      await setNotices($, l => l.map(x => (x.id === n.id ? { ...x, read: true } : x)))
+      await update($, selected, () => n.sessionId)
+      return update($, view, () => 'sessions')
+    }
     const LABEL = labels(C)
     const counts = { ongoing: list.filter(s => s.status === 'ongoing').length, complete: list.filter(s => s.status === 'complete').length }
     const shown = list
@@ -245,7 +349,49 @@ export const register: Register = on => {
         <Box flexDirection="row" gap="md" alignItems="center" flexWrap="wrap">
           <Text color={C.accent} size="heading" weight="bold">✱ Claude</Text>
           {order.map(id => <Nav id={id} />)}
+          <Button key="nav-notifications" plain variant={v === 'notifications' ? 'primary' : 'secondary'}
+            onPress={() => update($, view, () => 'notifications')}>
+            🔔{unread ? <Text color={C.accent} weight="bold"> {unread} new</Text> : ''}
+          </Button>
         </Box>
+
+        {v === 'notifications' && (
+          <Box flexDirection="column" gap="sm">
+            <Box flexDirection="row" justifyContent="space-between" alignItems="center" flexWrap="wrap" gap="sm">
+              <Box flexDirection="column">
+                <Text color={C.text} size="title" weight="bold">Notifications</Text>
+                <Text color={C.muted} wrap="wrap">{unread ? `${unread} unread` : 'All caught up.'}</Text>
+              </Box>
+              {inbox.length > 0 && (
+                <Box flexDirection="row" gap="sm">
+                  {unread > 0 && <Button key="notices-read" onPress={() => setNotices($, l => l.map(n => ({ ...n, read: true })))}>Mark all read</Button>}
+                  <Button key="notices-clear" onPress={() => setNotices($, () => [])}>Clear</Button>
+                </Box>
+              )}
+            </Box>
+            <Box flexDirection="column" backgroundColor={C.panel} borderStyle="round" borderColor={C.border}>
+              {inbox.length === 0 && (
+                <Box padding="md">
+                  <Text color={C.muted} wrap="wrap">Nothing yet. When a session finishes it shows up here{prefs.desktop ? ' and as a desktop notification' : ''}.</Text>
+                </Box>
+              )}
+              {inbox.map(n => (
+                <Box key={`notice-${n.id}`} flexDirection="row" alignItems="center" gap="md" paddingX="md" paddingY="xs"
+                  backgroundColor={n.read ? undefined : C.accentBg} hover={{ backgroundColor: C.bg }}>
+                  <Box flexGrow={1} flexDirection="column" minWidth={0} overflow="hidden">
+                    <Button key={`notice-open-${n.id}`} plain onPress={() => openNotice(n)}>
+                      <Text color={n.kind === 'finished' ? C.green : C.accent} weight="bold">{n.kind === 'finished' ? '✓' : '●'}</Text>{' '}
+                      <Text color={C.text} weight={n.read ? undefined : 'semibold'} wrap="truncate-end">{n.title}</Text>
+                      {'\n'}
+                      <Text color={C.muted} size="footnote">{HEAD[n.kind]} · {ago(n.at, now)}</Text>
+                    </Button>
+                  </Box>
+                  {!n.read && <Text color={C.accent}>● new</Text>}
+                </Box>
+              ))}
+            </Box>
+          </Box>
+        )}
 
         {v === 'settings' && (
           <Box flexDirection="column" gap="sm" backgroundColor={C.panel} borderStyle="round" borderColor={C.border} padding="md" minWidth={0} overflow="hidden">
@@ -259,6 +405,18 @@ export const register: Register = on => {
                 </Button>
               ))}
             </Box>
+            <Text color={C.text} weight="semibold">Notifications</Text>
+            <Box flexDirection="column" gap="xs">
+              {(['finished', 'started', 'desktop', 'toast'] as const).map(k => (
+                <Button key={`notify-${k}`} plain onPress={() => togglePref(k)}>
+                  <Text color={prefs[k] ? C.green : C.muted}>{prefs[k] ? '☑' : '☐'}</Text> <Text color={C.text}>{PREF_LABEL[k]}</Text>
+                </Button>
+              ))}
+            </Box>
+            <Box flexDirection="row" gap="sm" flexWrap="wrap">
+              <Button key="notify-test" onPress={() => void testNotify($)}>Send a test notification</Button>
+            </Box>
+            <Text color={C.muted} size="footnote" wrap="wrap">Desktop notifications use your terminal when it can show them. In the desktop app on Windows they are Windows notifications, and clicking one opens that session.</Text>
             <Text color={C.text} weight="semibold">Menu order</Text>
             <Text color={C.muted} size="footnote" wrap="wrap">Top to bottom here is left to right in the menu.</Text>
             <Box flexDirection="column" backgroundColor={C.bg} borderStyle="round" borderColor={C.border}>
